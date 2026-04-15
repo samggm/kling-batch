@@ -185,20 +185,7 @@ export default function App() {
     jobsRef.current = initial;
     setJobs([...initial]);
 
-    let videoUrl = refVideoUrlRef.current;
-    if (!videoUrl) {
-      try {
-        videoUrl = await uploadFile(refVideo);
-        refVideoUrlRef.current = videoUrl;
-      } catch (err) {
-        jobsRef.current = initial.map((j) => ({
-          ...j, status: "failed", error: "Failed to upload reference video: " + err.message,
-        }));
-        setJobs([...jobsRef.current]);
-        setRunning(false);
-        return;
-      }
-    }
+    const videoUrl = refVideoUrlRef.current;
 
     await Promise.all(initial.map((job) => submitWithRetry(job, videoUrl)));
     startPolling(videoUrl);
@@ -366,18 +353,22 @@ export default function App() {
             <div style={{ fontSize: 10, fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.08em", color: c.muted, marginBottom: 6 }}>
               Reference motion video
             </div>
-            <div
-              onClick={() => !running && vidRef.current?.click()}
-              style={{
-                border: `1px dashed ${refVideo ? c.success : c.border}`, borderRadius: 7,
-                padding: 16, textAlign: "center", cursor: running ? "default" : "pointer",
-                background: c.surface,
-              }}
-            >
-              <input ref={vidRef} type="file" accept="video/mp4,video/quicktime" onChange={handleVideo} />
-              {refVideo
-                ? <div style={{ fontSize: 12, color: c.success }}>✓ {refVideoName}</div>
-                : <div style={{ fontSize: 11, color: c.muted }}>Click to upload MP4</div>}
+            <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+              <input
+                type="text"
+                placeholder="Paste video URL from PiAPI playground"
+                value={refVideoName}
+                onChange={(e) => { setRefVideoName(e.target.value); setRefVideo(true); refVideoUrlRef.current = e.target.value; }}
+                disabled={running}
+                style={{
+                  background: c.surface, border: `1px solid ${refVideoName ? c.success : c.border}`, borderRadius: 5,
+                  padding: "8px 10px", color: c.text, fontFamily: mono, fontSize: 11,
+                  width: "100%", outline: "none",
+                }}
+              />
+              <div style={{ fontSize: 9, color: c.hint, lineHeight: 1.4 }}>
+                Upload your video at piapi.ai/kling-2-6/motion-control playground first, then paste the URL here
+              </div>
             </div>
           </div>
 
