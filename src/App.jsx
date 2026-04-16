@@ -1,6 +1,5 @@
 import { useState, useRef, useCallback, useEffect } from "react";
 
-const MAX_RETRIES = 3;
 const POLL_INTERVAL = 8000;
 
 const font = `'DM Sans', sans-serif`;
@@ -22,22 +21,13 @@ function fileToPreview(file) {
   });
 }
 
-function fileToBase64(file) {
-  return new Promise((r) => {
-    const fr = new FileReader();
-    fr.onload = () => r(fr.result.split(",")[1]);
-    fr.readAsDataURL(file);
-  });
-}
-
-function StatusBadge({ status, retries }) {
+function StatusBadge({ status }) {
   const m = {
     pending: { color: c.muted, label: "Pending" },
     uploading: { color: c.warn, label: "Uploading" },
     processing: { color: c.accent, label: "Processing" },
     completed: { color: c.success, label: "Done" },
     failed: { color: c.error, label: "Failed" },
-    retrying: { color: c.warn, label: `Retry ${retries}/${MAX_RETRIES}` },
   };
   const s = m[status] || m.pending;
   return (
@@ -49,7 +39,7 @@ function StatusBadge({ status, retries }) {
       <span style={{
         width: 5, height: 5, borderRadius: "50%", background: s.color,
         boxShadow: status === "processing" ? `0 0 6px ${s.color}` : "none",
-        animation: (status === "processing" || status === "retrying") ? "pulse 1.5s infinite" : "none",
+        animation: status === "processing" || status === "uploading" ? "pulse 1.5s infinite" : "none",
       }} />
       {s.label}
     </span>
@@ -68,9 +58,8 @@ export default function App() {
   const [jobs, setJobs] = useState([]);
   const [running, setRunning] = useState(false);
   const [batchDone, setBatchDone] = useState(false);
-  const [zipping, setZipping] = useState(false);
   const imgRef = useRef();
-  const vidRef = useRef();
+  const replaceImgRefs = useRef({});
   const jobsRef = useRef([]);
   const pollRef = useRef(null);
   const refVideoUrlRef = useRef("");
@@ -90,22 +79,7 @@ export default function App() {
 
   const removeImage = (i) => setImages((p) => p.filter((_, idx) => idx !== i));
 
-  const handleVideo = (e) => {
-    const f = e.target.files[0];
-    if (f) { setRefVideo(f); setRefVideoName(f.name); }
-    e.target.value = "";
-  };
-
-  // All API calls go through our /api/piapi proxy to avoid CORS
-  async function proxy(body) {
-    const r = await fetch("/api/piapi", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ apiKey, ...body }),
-    });
-    return await r.json();
-  }
-
+  // Upload file directly from browser to tmpfiles.org to avoid CORS and size limits
   async function uploadFile(file) {
     const fd = new FormData();
     fd.append("file", file);
@@ -120,6 +94,15 @@ export default function App() {
     throw new Error("File upload failed");
   }
 
+  // Proxy for PiAPI calls (avoids CORS)
+  async function proxy(body) {
+    const r = await fetch("/api/piapi", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ apiKey, ...body }),
+    });
+    return await r.json();
+  }
 
   async function submitJob(imageUrl, videoUrl) {
     const d = await proxy({
@@ -153,49 +136,81 @@ export default function App() {
     setJobs([...jobsRef.current]);
   }
 
-  async function submitWithRetry(job, videoUrl) {
-    for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
-      try {
-        if (attempt > 1) updateJob(job.id, { status: "retrying", retries: attempt });
-        const imageUrl = job.imageUrl || await uploadFile(job.file);
-        if (!job.imageUrl) updateJob(job.id, { imageUrl });
-        const taskId = await submitJob(imageUrl, videoUrl);
-        updateJob(job.id, { status: "processing", taskId, error: null });
-        return true;
-      } catch (err) {
-        if (attempt === MAX_RETRIES) {
-          updateJob(job.id, {
-            status: "failed",
-            error: `Failed after ${MAX_RETRIES} attempts: ${err.message}`,
-          });
-          return false;
-        }
-        await new Promise((r) => setTimeout(r, 2000 * attempt));
-      }
+  // Submit a single job (used by start, retry, and replace-then-retry)
+  async function submitSingleJob(job, videoUrl) {
+    try {
+      updateJob(job.id, { status: "uploading", error: null });
+      const imageUrl = job.imageUrl || await uploadFile(job.file);
+      if (!job.imageUrl) updateJob(job.id, { imageUrl });
+      const taskId = await submitJob(imageUrl, videoUrl);
+      updateJob(job.id, { status: "processing", taskId, error: null, videoUrl: null });
+      return true;
+    } catch (err) {
+      updateJob(job.id, { status: "failed", error: err.message });
+      return false;
     }
-    return false;
   }
 
   async function startBatch() {
-    if (!apiKey || !refVideo || images.length === 0) return;
+    if (!apiKey || !refVideoUrlRef.current || images.length === 0) return;
     setRunning(true);
     setBatchDone(false);
 
     const initial = images.map((img, i) => ({
       id: i, imageName: img.name, file: img.file, preview: img.preview,
       status: "uploading", taskId: null, videoUrl: null, imageUrl: null,
-      error: null, retries: 0,
+      error: null,
     }));
     jobsRef.current = initial;
     setJobs([...initial]);
 
     const videoUrl = refVideoUrlRef.current;
 
-    await Promise.all(initial.map((job) => submitWithRetry(job, videoUrl)));
-    startPolling(videoUrl);
+    await Promise.all(initial.map((job) => submitSingleJob(job, videoUrl)));
+    startPolling();
   }
 
-  function startPolling(videoUrl) {
+  // Retry a single job with same image
+  async function retryJob(jobId) {
+    const job = jobsRef.current.find((j) => j.id === jobId);
+    if (!job) return;
+    const videoUrl = refVideoUrlRef.current;
+    if (!batchDone) {
+      // If batch polling is still active, just resubmit
+      await submitSingleJob(job, videoUrl);
+    } else {
+      // If batch ended, restart polling for this retry
+      setBatchDone(false);
+      setRunning(true);
+      await submitSingleJob(job, videoUrl);
+      startPolling();
+    }
+  }
+
+  // Replace image on a failed job and retry
+  async function replaceAndRetry(jobId, newFile) {
+    const preview = await fileToPreview(newFile);
+    updateJob(jobId, {
+      file: newFile,
+      imageName: newFile.name,
+      preview,
+      imageUrl: null, // Force re-upload
+      status: "uploading",
+      error: null,
+    });
+    const videoUrl = refVideoUrlRef.current;
+    const job = jobsRef.current.find((j) => j.id === jobId);
+    if (!batchDone) {
+      await submitSingleJob(job, videoUrl);
+    } else {
+      setBatchDone(false);
+      setRunning(true);
+      await submitSingleJob(job, videoUrl);
+      startPolling();
+    }
+  }
+
+  function startPolling() {
     if (pollRef.current) clearInterval(pollRef.current);
     pollRef.current = setInterval(async () => {
       const processing = jobsRef.current.filter((j) => j.status === "processing");
@@ -215,15 +230,8 @@ export default function App() {
               data?.output?.works?.[0]?.video?.resource || "";
             updateJob(job.id, { status: "completed", videoUrl: vUrl });
           } else if (data?.status === "failed") {
-            const errMsg = data?.error?.message || "Generation failed";
-            const current = jobsRef.current.find((j) => j.id === job.id);
-            const retryCount = (current?.retries || 0) + 1;
-            if (retryCount <= MAX_RETRIES) {
-              updateJob(job.id, { retries: retryCount, status: "retrying" });
-              await submitWithRetry({ ...current, retries: retryCount }, videoUrl);
-            } else {
-              updateJob(job.id, { status: "failed", error: errMsg });
-            }
+            const errMsg = data?.error?.raw_message || data?.error?.message || "Generation failed";
+            updateJob(job.id, { status: "failed", error: errMsg });
           }
         } catch (_) {}
       }
@@ -234,50 +242,17 @@ export default function App() {
     if (pollRef.current) clearInterval(pollRef.current);
   }, []);
 
-  async function downloadZip() {
-    setZipping(true);
-    try {
-      const { default: JSZip } = await import("https://esm.sh/jszip@3.10.1");
-      const zip = new JSZip();
-      const completed = jobsRef.current.filter(
-        (j) => j.status === "completed" && j.videoUrl
-      );
-      let num = 1;
-      for (const job of completed) {
-        try {
-          const resp = await fetch(job.videoUrl);
-          const blob = await resp.blob();
-          zip.file(`${num}.mp4`, blob);
-          num++;
-        } catch (_) {}
-      }
-      const content = await zip.generateAsync({ type: "blob" });
-      const url = URL.createObjectURL(content);
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = `batch_${new Date().toISOString().slice(0, 10)}.zip`;
-      document.body.appendChild(a);
-      a.click();
-      document.body.removeChild(a);
-      URL.revokeObjectURL(url);
-    } catch (err) {
-      alert("ZIP download failed: " + err.message);
-    }
-    setZipping(false);
-  }
-
   function resetBatch() {
     setJobs([]);
     setBatchDone(false);
     setImages([]);
-    setRefVideo(null);
     setRefVideoName("");
     refVideoUrlRef.current = "";
   }
 
   const completedCount = jobs.filter((j) => j.status === "completed").length;
   const processingCount = jobs.filter(
-    (j) => j.status === "processing" || j.status === "retrying" || j.status === "uploading"
+    (j) => j.status === "processing" || j.status === "uploading"
   ).length;
   const failedCount = jobs.filter((j) => j.status === "failed").length;
   const spent = completedCount * perVideo;
@@ -360,9 +335,9 @@ export default function App() {
             <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
               <input
                 type="text"
-                placeholder="Paste video URL from PiAPI playground"
+                placeholder="Paste video URL"
                 value={refVideoName}
-                onChange={(e) => { setRefVideoName(e.target.value); setRefVideo(true); refVideoUrlRef.current = e.target.value; }}
+                onChange={(e) => { setRefVideoName(e.target.value); refVideoUrlRef.current = e.target.value; }}
                 disabled={running}
                 style={{
                   background: c.surface, border: `1px solid ${refVideoName ? c.success : c.border}`, borderRadius: 5,
@@ -371,7 +346,7 @@ export default function App() {
                 }}
               />
               <div style={{ fontSize: 9, color: c.hint, lineHeight: 1.4 }}>
-                Upload your video at piapi.ai/kling-2-6/motion-control playground first, then paste the URL here
+                Upload your video to tmpfiles.org, streamable.com, or discord, then paste the direct URL here
               </div>
             </div>
           </div>
@@ -484,13 +459,13 @@ export default function App() {
             </div>
           </div>
 
-          {!batchDone ? (
+          {jobs.length === 0 ? (
             <button
               onClick={startBatch}
-              disabled={running || !connected || !refVideo || images.length === 0}
+              disabled={running || !connected || !refVideoName || images.length === 0}
               style={{
                 width: "100%", padding: "12px 0", borderRadius: 7,
-                background: running || !connected || !refVideo || images.length === 0 ? c.tag : c.accent,
+                background: running || !connected || !refVideoName || images.length === 0 ? c.tag : c.accent,
                 border: "none", color: "#fff", fontSize: 13, fontWeight: 700,
                 cursor: running ? "not-allowed" : "pointer",
               }}
@@ -519,7 +494,7 @@ export default function App() {
               flexDirection: "column", gap: 6,
             }}>
               <div style={{ fontSize: 28, opacity: 0.25 }}>⬡</div>
-              <div>Upload a reference video and character images to start</div>
+              <div>Paste a reference video URL and upload character images to start</div>
             </div>
           ) : (
             <>
@@ -544,30 +519,16 @@ export default function App() {
                 </div>
               </div>
 
-              {batchDone && completedCount > 0 && (
-                <button
-                  onClick={downloadZip} disabled={zipping}
-                  style={{
-                    width: "100%", padding: "11px 0", borderRadius: 7,
-                    background: c.success, border: "none", color: "#fff",
-                    fontSize: 13, fontWeight: 700,
-                    cursor: zipping ? "wait" : "pointer",
-                    marginBottom: 16, opacity: zipping ? 0.7 : 1,
-                  }}
-                >
-                  {zipping ? "Zipping..." : `Download all (${completedCount} video${completedCount !== 1 ? "s" : ""}) as ZIP`}
-                </button>
-              )}
-
               <div style={{
                 display: "grid",
-                gridTemplateColumns: "repeat(auto-fill, minmax(200px, 1fr))",
-                gap: 10,
+                gridTemplateColumns: "repeat(auto-fill, minmax(220px, 1fr))",
+                gap: 12,
               }}>
                 {jobs.map((job, idx) => (
                   <div key={job.id} style={{
                     background: c.surface, borderRadius: 9,
-                    border: `1px solid ${c.border}`, overflow: "hidden",
+                    border: `1px solid ${job.status === "failed" ? c.error + "40" : c.border}`,
+                    overflow: "hidden",
                     animation: "fadeIn 0.3s ease",
                     animationDelay: `${idx * 40}ms`, animationFillMode: "both",
                   }}>
@@ -577,10 +538,10 @@ export default function App() {
                       ) : (
                         <img src={job.preview} alt="" style={{
                           width: "100%", height: "100%", objectFit: "cover",
-                          opacity: (job.status === "processing" || job.status === "retrying") ? 0.4 : 0.7,
+                          opacity: (job.status === "processing" || job.status === "uploading") ? 0.4 : 0.7,
                         }} />
                       )}
-                      {(job.status === "processing" || job.status === "retrying" || job.status === "uploading") && (
+                      {(job.status === "processing" || job.status === "uploading") && (
                         <div style={{
                           position: "absolute", inset: 0,
                           display: "flex", alignItems: "center", justifyContent: "center",
@@ -596,33 +557,77 @@ export default function App() {
                         </div>
                       )}
                     </div>
-                    <div style={{ padding: "8px 10px" }}>
+                    <div style={{ padding: "10px 12px" }}>
                       <div style={{
                         display: "flex", justifyContent: "space-between",
-                        alignItems: "center", marginBottom: 3,
+                        alignItems: "center", marginBottom: 4,
                       }}>
                         <span style={{
                           fontSize: 10, fontFamily: mono, color: c.text,
                           overflow: "hidden", textOverflow: "ellipsis",
-                          whiteSpace: "nowrap", maxWidth: 120,
+                          whiteSpace: "nowrap", maxWidth: 130,
                         }}>{job.imageName}</span>
-                        <StatusBadge status={job.status} retries={job.retries || 0} />
+                        <StatusBadge status={job.status} />
                       </div>
-                      {job.error && (
-                        <div style={{ fontSize: 9, color: c.error, marginTop: 3, lineHeight: 1.3 }}>
-                          {job.error}
+
+                      {/* Failure UI with retry + replace buttons */}
+                      {job.status === "failed" && (
+                        <div style={{ marginTop: 8 }}>
+                          <div style={{
+                            fontSize: 10, color: c.error, lineHeight: 1.4,
+                            padding: "6px 8px", background: c.error + "12",
+                            borderRadius: 4, border: `1px solid ${c.error}30`,
+                            marginBottom: 8,
+                          }}>
+                            {job.error?.toLowerCase().includes("content violation") || job.error?.toLowerCase().includes("nsfw")
+                              ? "⚠ Blocked by Kling content filter (likely NSFW). Try a different image."
+                              : job.error || "Unknown error"}
+                          </div>
+                          <div style={{ display: "flex", gap: 5 }}>
+                            <button
+                              onClick={() => retryJob(job.id)}
+                              style={{
+                                flex: 1, padding: "7px 0", borderRadius: 5,
+                                background: c.accent, border: "none", color: "#fff",
+                                fontSize: 10, fontWeight: 600, cursor: "pointer",
+                              }}
+                            >
+                              Retry
+                            </button>
+                            <button
+                              onClick={() => replaceImgRefs.current[job.id]?.click()}
+                              style={{
+                                flex: 1, padding: "7px 0", borderRadius: 5,
+                                background: c.surface, border: `1px solid ${c.border}`,
+                                color: c.text, fontSize: 10, fontWeight: 600, cursor: "pointer",
+                              }}
+                            >
+                              Replace image
+                            </button>
+                            <input
+                              ref={(el) => { replaceImgRefs.current[job.id] = el; }}
+                              type="file"
+                              accept="image/jpeg,image/png,image/webp"
+                              onChange={(e) => {
+                                const f = e.target.files[0];
+                                if (f) replaceAndRetry(job.id, f);
+                                e.target.value = "";
+                              }}
+                            />
+                          </div>
                         </div>
                       )}
+
                       {job.videoUrl && (
                         <a
                           href={job.videoUrl}
                           download={job.imageName.replace(/\.\w+$/, "") + ".mp4"}
                           target="_blank" rel="noreferrer"
                           style={{
-                            display: "block", marginTop: 6, textAlign: "center",
-                            padding: "5px 0", borderRadius: 4,
+                            display: "block", marginTop: 8, textAlign: "center",
+                            padding: "7px 0", borderRadius: 5,
                             background: c.accent + "18", color: c.accent,
-                            fontSize: 10, fontWeight: 600, textDecoration: "none",
+                            fontSize: 11, fontWeight: 600, textDecoration: "none",
                             border: `1px solid ${c.accent}30`,
                           }}
                         >
