@@ -107,15 +107,19 @@ export default function App() {
   }
 
   async function uploadFile(file) {
-    const base64 = await fileToBase64(file);
-    const d = await proxy({
-      action: "upload",
-      file_name: file.name,
-      file_data: base64,
+    const fd = new FormData();
+    fd.append("file", file);
+    const r = await fetch("https://tmpfiles.org/api/v1/upload", {
+      method: "POST",
+      body: fd,
     });
-    if (d?.data?.url) return d.data.url;
-    throw new Error(d?.message || d?.error || "File upload failed");
+    const d = await r.json();
+    if (d?.data?.url) {
+      return d.data.url.replace("tmpfiles.org/", "tmpfiles.org/dl/");
+    }
+    throw new Error("File upload failed");
   }
+
 
   async function submitJob(imageUrl, videoUrl) {
     const d = await proxy({
