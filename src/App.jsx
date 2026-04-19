@@ -152,16 +152,18 @@ export default function App() {
       };
       img.src = URL.createObjectURL(file);
     });
-    const fd = new FormData();
-    fd.append("reqtype", "fileupload");
-    fd.append("fileToUpload", compressed, compressed.name);
-    const r = await fetch("https://catbox.moe/user/api.php", {
-      method: "POST",
-      body: fd,
+    const base64 = await new Promise((resolve) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(reader.result.split(",")[1]);
+      reader.readAsDataURL(compressed);
     });
-    const url = await r.text();
-    if (url && url.startsWith("https://")) return url.trim();
-    throw new Error("File upload failed");
+    const d = await proxy({
+      action: "upload",
+      file_name: compressed.name,
+      file_data: base64,
+    });
+    if (d?.data?.url) return d.data.url;
+    throw new Error(d?.message || d?.error || "File upload failed");
   }
   async function proxy(body) {
     const r = await fetch("/api/piapi", {
